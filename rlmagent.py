@@ -133,7 +133,41 @@ start = <inclusive integer offset into context>
 end = <exclusive integer offset into context>
 query = <non-empty question for the child agent>
 
-The host retrieves context[start:end] from the unchanged original context and invokes the child agent outside the interpreter. Do not create, return, or assign a replacement context value. If you can answer, return plain text or FINAL(answer), with no Python code block."""
+The host retrieves context[start:end] from the unchanged original context and invokes the child agent outside the interpreter. Do not create, return, or assign a replacement context value. If you can answer, return plain text or FINAL(answer), with no Python code block.
+
+Few-shot examples:
+
+Example 1 — locate a relevant section and request a focused child analysis:
+```python
+marker = context.find("quarterly revenue")
+start = max(0, marker - 300)
+end = min(len(context), marker + 1200)
+query = "Extract the quarterly revenue figures and explain the trend."
+```
+
+Example 2 — use metadata to choose the relevant range, while still returning only offsets:
+```python
+marker = context.find(metadata)
+start = max(0, marker - 200)
+end = min(len(context), marker + 800)
+query = "Summarize the evidence in this selected range."
+```
+
+Example 3 — valid direct answer when no further context selection is needed:
+```text
+The answer is that revenue increased each quarter.
+```
+
+Invalid example — never replace the original context or create a replacement context variable:
+```python
+selected_context = context[100:500]
+context = selected_context
+start = 0
+end = len(selected_context)
+query = "Analyze this replacement context."
+```
+
+For a selection, output only the three required assignments (`start`, `end`, and `query`) inside one Python code block. The host, not your code, performs the slice and the recursive model call."""
 
         prompt = f"{instructions}\n\nQuery:\n{query}\n\nMetadata:\n{metadata}\n\nRecursion depth: {depth}"
         if selected_context is not None:
