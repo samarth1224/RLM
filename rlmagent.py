@@ -1,8 +1,9 @@
 """Recursive Language Model controller.
 
-The model may emit Python only to select a range from the original context. The
-controller executes that code through ``REPL`` and performs every recursive LLM
-call itself; generated code never invokes an LLM directly.
+The model may emit Python only to select context ranges for sub-agents. The
+controller executes that code through ``REPL`` and instantiates child ``RLM``
+objects to perform recursive model calls; generated code never invokes an LLM
+directly.
 """
 
 from __future__ import annotations
@@ -26,14 +27,13 @@ class CodeExecutionError(RLMError):
 
 
 class RLM:
-    """A synchronous RLM that recurses through host-controlled child calls.
+    """A synchronous RLM that recurses through object-instantiated child calls.
 
-    The first/root model call sees the query and metadata but not the full
-    context. It can return a normal answer or a Python code block that defines
-    ``start``, ``end``, and ``query``. The controller retrieves
-    ``original_context[start:end]`` and passes that slice to the child model.
-    The same REPL, and therefore the same original context and metadata, stays
-    alive throughout the whole recursive request.
+    The root model call sees the query and metadata, and can inspect the full
+    context via the local REPL. It can return a normal answer or a Python code
+    block that defines a list of sub-agent calls ``sub_calls = [{"start": ..., "end": ..., "query": ...}, ...]``.
+    For each sub-call, the controller retrieves ``context[start:end]`` and
+    instantiates a child ``RLM`` instance with that sliced context.
     """
 
     _code_block = re.compile(r"```(?:python|py)?\s*\n(.*?)```", re.IGNORECASE | re.DOTALL)
@@ -53,12 +53,17 @@ class RLM:
         self.context = context
         self.recursion_depth = recursion_depth
 
-    def call_rlm(self, query: str, context: str | None = None, metadata: str = "") -> str:
-        """Answer ``query`` over ``context`` using bounded recursive subcalls.
+    def call_rlm(
+        self,
+        query: str,
+        context: str | None = None,
+        metadata: str = "",
+    ) -> str:
+        """Answer ``query`` over ``context`` using bounded recursive sub-agents.
 
         ``context`` supplied here becomes the immutable global context in the
-        REPL for this top-level request. A recursively selected slice is only
-        supplied to the child model; it never replaces that global context.
+        REPL for this request. Sub-agents are instantiated as independent ``RLM``
+        objects with their own sliced context and decremented recursion depth.
         """
         source_context = self.context if context is None else context
         if source_context is None:
@@ -66,64 +71,108 @@ class RLM:
         if not isinstance(query, str) or not query.strip():
             raise ValueError("query must be a non-empty string")
 
-        print(f"[RLM: {self.name}] Starting RLM run...")
+        print(f"\n{'='*20} [RLM: {self.name} (depth_budget={self.recursion_depth})] {'='*20}")
+        print(f"[RLM: {self.name}] Query: {query}")
         print(f"[RLM: {self.name}] Context length: {len(source_context)} characters")
+
         repl = REPL(context=source_context, metadata=metadata)
-        answer = self._call(query=query, repl=repl, selected_context=None, depth=0)
-        print(f"[RLM: {self.name}] RLM run completed.")
+        # When an agent was instantiated with an explicit child context (sub-agent), pass that context slice
+        selected_context = self.context if self.context is not None and context is None else None
+        if selected_context is not None:
+            print(f"[RLM: {self.name}] Selected context length: {len(selected_context)} characters")
+
+        answer = self._call_rlm(
+            query=query,
+            repl=repl,
+            selected_context=selected_context,
+        )
+        print(f"[RLM: {self.name}] Completed.")
         return answer
 
-    def _call(self, query: str, repl: REPL, selected_context: str | None, depth: int) -> str:
-        print(f"\n--- [RLM: {self.name} | Depth {depth}] ---")
-        print(f"Query: {query}")
-        if selected_context is not None:
-            print(f"Selected context length: {len(selected_context)} characters")
-
+    def _call_rlm(
+        self,
+        query: str,
+        repl: REPL,
+        selected_context: str | None,
+    ) -> str:
+        """Private execution method: handles prompt construction, model calling, sub-agent dispatch & synthesis."""
         prompt = self._build_prompt(
             query=query,
             metadata=repl.metadata,
             selected_context=selected_context,
-            depth=depth,
+            depth=self.recursion_depth,
         )
-        print(f"[RLM: {self.name} | Depth {depth}] Calling LLM...")
+
+        print(f"[RLM: {self.name}] Calling LLM...")
         response = self.model.call_llm(prompt)
         if not isinstance(response, str):
             raise RLMError("LLM call must return a string response")
 
-        print(f"[RLM: {self.name} | Depth {depth}] LLM response:\n{response.strip()}\n")
+        print(f"[RLM: {self.name}] LLM response:\n{response.strip()}\n")
 
         code = self._extract_code(response)
         if code is None:
             answer = self._final_answer(response)
-            print(f"[RLM: {self.name} | Depth {depth}] Final answer determined.")
+            print(f"[RLM: {self.name}] Final answer determined directly.")
             return answer
 
-        if depth >= self.recursion_depth:
-            print(f"[RLM: {self.name} | Depth {depth}] Recursion depth limit ({self.recursion_depth}) reached.")
+        if self.recursion_depth <= 0:
+            print(f"[RLM: {self.name}] Recursion depth limit reached (0 remaining). Cannot spawn sub-agents.")
             raise RecursionLimitError(
-                f"RLM '{self.name}' reached recursion depth {self.recursion_depth} before a final answer."
+                f"RLM '{self.name}' reached recursion depth limit before a final answer."
             )
 
-        print(f"[RLM: {self.name} | Depth {depth}] Executing selection code in REPL:\n{code}")
+        print(f"[RLM: {self.name}] Executing generated selection code in REPL:\n{code}")
         execution = repl.execute_code(code)
-        if not execution.succeeded or execution.selection is None:
-            details = execution.error or "Generated code did not produce a context selection."
-            print(f"[RLM: {self.name} | Depth {depth}] Code execution failed: {details}")
+        if not execution.succeeded or not execution.selections:
+            details = execution.error or "Generated code did not produce valid sub-agent selections."
+            print(f"[RLM: {self.name}] Code execution failed: {details}")
             raise CodeExecutionError(details)
 
-        selection = execution.selection
-        print(
-            f"[RLM: {self.name} | Depth {depth}] Selected range: [{selection.start}:{selection.end}], "
-            f"Child query: {selection.query!r}"
+        selections = execution.selections
+        print(f"[RLM: {self.name}] Code execution succeeded. Dispatching {len(selections)} sub-agent(s):")
+
+        sub_results: list[dict[str, str]] = []
+        for i, sel in enumerate(selections, 1):
+            print(
+                f"[RLM: {self.name}] -> Sub-agent {i}/{len(selections)}: range [{sel.start}:{sel.end}], "
+                f"query: {sel.query!r}"
+            )
+            child_context = repl.context[sel.start : sel.end]
+            sub_agent = RLM(
+                name=f"{self.name}_sub_{i}",
+                model=self.model,
+                context=child_context,
+                recursion_depth=self.recursion_depth - 1,
+            )
+            child_answer = sub_agent.call_rlm(
+                query=sel.query,
+                metadata=repl.metadata,
+            )
+            print(f"[RLM: {self.name}] <- Sub-agent {i}/{len(selections)} returned result.")
+            sub_results.append({"query": sel.query, "answer": child_answer})
+
+        # If single sub-agent was invoked with identical query, return its answer directly
+        if len(sub_results) == 1 and sub_results[0]["query"].strip() == query.strip():
+            print(f"[RLM: {self.name}] Single sub-agent answered original query directly.")
+            return sub_results[0]["answer"]
+
+        # Otherwise synthesize responses from all sub-agents
+        print(f"[RLM: {self.name}] Synthesizing final answer from {len(sub_results)} sub-agent result(s)...")
+        synthesis_prompt = self._build_synthesis_prompt(
+            query=query,
+            metadata=repl.metadata,
+            sub_results=sub_results,
         )
-        child_context = repl.context[selection.start : selection.end]
-        print(f"[RLM: {self.name} | Depth {depth}] Recursing to depth {depth + 1}...")
-        return self._call(
-            query=selection.query,
-            repl=repl,
-            selected_context=child_context,
-            depth=depth + 1,
-        )
+        print(f"[RLM: {self.name}] Calling LLM for synthesis...")
+        synthesis_response = self.model.call_llm(synthesis_prompt)
+        if not isinstance(synthesis_response, str):
+            raise RLMError("LLM synthesis call must return a string response")
+
+        print(f"[RLM: {self.name}] LLM synthesis response:\n{synthesis_response.strip()}\n")
+        answer = self._final_answer(synthesis_response)
+        print(f"[RLM: {self.name}] Final synthesized answer determined.")
+        return answer
 
     @classmethod
     def _extract_code(cls, response: str) -> str | None:
@@ -146,52 +195,88 @@ class RLM:
         selected_context: str | None,
         depth: int,
     ) -> str:
-        instructions = """You are an RLM controller. Answer the user's query when you have enough evidence.
+        instructions = """You are an RLM (Recursive Language Model) controller. Answer the user's query when you have enough evidence.
 
-The original context is available only to generated local Python code as the read-only variable `context`. Its metadata is available as the read-only variable `metadata`. Generated code never calls a model.
+The original context is available to generated local Python code as the read-only variable `context`. Its metadata is available as the read-only variable `metadata`. Generated code never calls a model directly.
 
-If another agent should inspect a portion of the original context, respond with exactly one Python code block. That code may inspect `context` and `metadata`, but it must not assign to either. It must set:
-start = <inclusive integer offset into context>
-end = <exclusive integer offset into context>
-query = <non-empty question for the child agent>
+If you need one or more sub-agents to inspect portions of the context, respond with exactly one Python code block. That code may inspect `context` and `metadata`, but it must not assign to either. It must set `sub_calls` as a list of dictionaries, where each dictionary specifies:
+- "start": <inclusive integer offset into context>
+- "end": <exclusive integer offset into context>
+- "query": <non-empty question/prompt for the sub-agent>
 
-The host retrieves context[start:end] from the unchanged original context and invokes the child agent outside the interpreter. Do not create, return, or assign a replacement context value. If you can answer, return plain text or FINAL(answer), with no Python code block.
+The host retrieves context[start:end] for each item, instantiates a child sub-agent for each range, and passes the selected slice and query to that sub-agent. Do not create, return, or assign a replacement context variable.
+
+If you have enough information to answer directly, do NOT output Python code. Return plain text or FINAL(answer).
 
 Few-shot examples:
 
-Example 1 — locate a relevant section and request a focused child analysis:
+Example 1 — locate a relevant section and spawn a single child agent:
 ```python
 marker = context.find("quarterly revenue")
-start = max(0, marker - 300)
-end = min(len(context), marker + 1200)
-query = "Extract the quarterly revenue figures and explain the trend."
+sub_calls = [
+    {
+        "start": max(0, marker - 300),
+        "end": min(len(context), marker + 1200),
+        "query": "Extract the quarterly revenue figures and explain the trend."
+    }
+]
 ```
 
-Example 2 — use metadata to choose the relevant range, while still returning only offsets:
+Example 2 — spawn multiple sub-agents to inspect different sections:
 ```python
-marker = context.find(metadata)
-start = max(0, marker - 200)
-end = min(len(context), marker + 800)
-query = "Summarize the evidence in this selected range."
+pos1 = context.find("Section 1: Methodology")
+pos2 = context.find("Section 2: Results")
+pos3 = context.find("Section 3: Discussion")
+sub_calls = [
+    {
+        "start": pos1,
+        "end": pos2,
+        "query": "Summarize the methodology used in the study."
+    },
+    {
+        "start": pos2,
+        "end": pos3 if pos3 != -1 else len(context),
+        "query": "Extract all numerical results and performance metrics."
+    }
+]
 ```
 
 Example 3 — valid direct answer when no further context selection is needed:
 ```text
-The answer is that revenue increased each quarter.
+The answer is that revenue increased by 15% in Q3.
 ```
 
-Invalid example — never replace the original context or create a replacement context variable:
+Invalid example — never replace the original context or assign to context:
 ```python
-selected_context = context[100:500]
-context = selected_context
-start = 0
-end = len(selected_context)
-query = "Analyze this replacement context."
+context = context[100:500]
+sub_calls = [{"start": 0, "end": len(context), "query": "Analyze"}]
 ```
 
-For a selection, output only the three required assignments (`start`, `end`, and `query`) inside one Python code block. The host, not your code, performs the slice and the recursive model call."""
+For selection, output only the `sub_calls` list assignment inside one Python code block. The host controller, not your code, handles slicing and invoking the sub-agents."""
 
-        prompt = f"{instructions}\n\nQuery:\n{query}\n\nMetadata:\n{metadata}\n\nRecursion depth: {depth}"
+        prompt = f"{instructions}\n\nQuery:\n{query}\n\nMetadata:\n{metadata}\n\nRecursion depth available: {depth}"
         if selected_context is not None:
-            prompt += f"\n\nSelected context for this child agent:\n{selected_context}"
+            prompt += f"\n\nSelected context for this agent:\n{selected_context}"
         return prompt
+
+    @staticmethod
+    def _build_synthesis_prompt(
+        query: str,
+        metadata: str,
+        sub_results: list[dict[str, str]],
+    ) -> str:
+        results_formatted = []
+        for i, res in enumerate(sub_results, 1):
+            results_formatted.append(
+                f"Sub-agent {i} Task: {res['query']}\nSub-agent {i} Output: {res['answer']}"
+            )
+        combined_results = "\n\n".join(results_formatted)
+
+        return (
+            f"You are the main RLM controller. You previously dispatched sub-agents to inspect context segments.\n\n"
+            f"Original Query:\n{query}\n\n"
+            f"Metadata:\n{metadata}\n\n"
+            f"Sub-agent Results:\n{combined_results}\n\n"
+            f"Using the sub-agent results above, provide the final, complete answer to the original query. "
+            f"Return plain text or FINAL(answer), with no Python code blocks."
+        )
