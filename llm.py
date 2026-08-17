@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 
@@ -42,8 +43,32 @@ class BaseLLM:
         return response
 
     def _call_llm(self, prompt: str) -> str:
-        """Private provider call to be overridden by adapter subclasses."""
+        """Private synchronous provider call to be overridden by adapter subclasses."""
         raise NotImplementedError("Subclasses must implement _call_llm")
+
+    async def call_llm_async(self, prompt: str) -> str:
+        """Public async entry point: validates inputs, awaits provider call, and validates output."""
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise ValueError("prompt must be a non-empty string")
+
+        try:
+            response = await self._call_llm_async(prompt)
+        except Exception as error:
+            if isinstance(error, LLMCallError):
+                raise
+            raise LLMCallError(
+                f"{self.provider} request failed: {error}"
+            ) from error
+
+        if not isinstance(response, str) or not response.strip():
+            raise LLMCallError(
+                f"{self.provider} returned an empty or invalid response."
+            )
+        return response
+
+    async def _call_llm_async(self, prompt: str) -> str:
+        """Private async provider call. Defaults to executing _call_llm in a worker thread."""
+        return await asyncio.to_thread(self._call_llm, prompt)
 
 
 class GeminiLLM(BaseLLM):
@@ -72,9 +97,19 @@ class GeminiLLM(BaseLLM):
         self._client: Any = genai.Client(api_key=api_key)
 
     def _call_llm(self, prompt: str) -> str:
-        """Send a text prompt to Gemini and return its generated text."""
+        """Send a text prompt to Gemini synchronously and return its generated text."""
         response = self._client.models.generate_content(
             model=self.model_name,
             contents=prompt,
         )
         return response.text
+
+    async def _call_llm_async(self, prompt: str) -> str:
+        """Send a text prompt to Gemini asynchronously and return its generated text."""
+        if hasattr(self._client, "aio") and hasattr(self._client.aio, "models"):
+            response = await self._client.aio.models.generate_content(
+                model=self.model_name,
+                contents=prompt,
+            )
+            return response.text
+        return await asyncio.to_thread(self._call_llm, prompt)

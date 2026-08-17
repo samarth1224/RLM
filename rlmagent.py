@@ -8,6 +8,7 @@ directly.
 
 from __future__ import annotations
 
+import asyncio
 import re
 
 from llm import BaseLLM
@@ -27,7 +28,7 @@ class CodeExecutionError(RLMError):
 
 
 class RLM:
-    """A synchronous RLM that recurses through object-instantiated child calls.
+    """A synchronous and asynchronous RLM that recurses through child instances.
 
     The root model call sees the query and metadata, and can inspect the full
     context via the local REPL. It can return a normal answer or a Python code
@@ -59,12 +60,7 @@ class RLM:
         context: str | None = None,
         metadata: str = "",
     ) -> str:
-        """Answer ``query`` over ``context`` using bounded recursive sub-agents.
-
-        ``context`` supplied here becomes the immutable global context in the
-        REPL for this request. Sub-agents are instantiated as independent ``RLM``
-        objects with their own sliced context and decremented recursion depth.
-        """
+        """Answer ``query`` over ``context`` using synchronous recursive sub-agents."""
         source_context = self.context if context is None else context
         if source_context is None:
             raise ValueError("context must be provided to the RLM constructor or call_rlm")
@@ -76,7 +72,6 @@ class RLM:
         print(f"[RLM: {self.name}] Context length: {len(source_context)} characters")
 
         repl = REPL(context=source_context, metadata=metadata)
-        # When an agent was instantiated with an explicit child context (sub-agent), pass that context slice
         selected_context = self.context if self.context is not None and context is None else None
         if selected_context is not None:
             print(f"[RLM: {self.name}] Selected context length: {len(selected_context)} characters")
@@ -95,7 +90,7 @@ class RLM:
         repl: REPL,
         selected_context: str | None,
     ) -> str:
-        """Private execution method: handles prompt construction, model calling, sub-agent dispatch & synthesis."""
+        """Private synchronous execution loop: prompt building, model calling, sub-agent dispatch & synthesis."""
         prompt = self._build_prompt(
             query=query,
             metadata=repl.metadata,
@@ -130,7 +125,7 @@ class RLM:
             raise CodeExecutionError(details)
 
         selections = execution.selections
-        print(f"[RLM: {self.name}] Code execution succeeded. Dispatching {len(selections)} sub-agent(s):")
+        print(f"[RLM: {self.name}] Code execution succeeded. Dispatching {len(selections)} sub-agent(s) sequentially:")
 
         sub_results: list[dict[str, str]] = []
         for i, sel in enumerate(selections, 1):
@@ -166,6 +161,128 @@ class RLM:
         )
         print(f"[RLM: {self.name}] Calling LLM for synthesis...")
         synthesis_response = self.model.call_llm(synthesis_prompt)
+        if not isinstance(synthesis_response, str):
+            raise RLMError("LLM synthesis call must return a string response")
+
+        print(f"[RLM: {self.name}] LLM synthesis response:\n{synthesis_response.strip()}\n")
+        answer = self._final_answer(synthesis_response)
+        print(f"[RLM: {self.name}] Final synthesized answer determined.")
+        return answer
+
+    async def call_rlm_async(
+        self,
+        query: str,
+        context: str | None = None,
+        metadata: str = "",
+    ) -> str:
+        """Answer ``query`` over ``context`` using asynchronous concurrent sub-agents."""
+        source_context = self.context if context is None else context
+        if source_context is None:
+            raise ValueError("context must be provided to the RLM constructor or call_rlm_async")
+        if not isinstance(query, str) or not query.strip():
+            raise ValueError("query must be a non-empty string")
+
+        print(f"\n{'='*20} [RLM (Async): {self.name} (depth_budget={self.recursion_depth})] {'='*20}")
+        print(f"[RLM: {self.name}] Query: {query}")
+        print(f"[RLM: {self.name}] Context length: {len(source_context)} characters")
+
+        repl = REPL(context=source_context, metadata=metadata)
+        selected_context = self.context if self.context is not None and context is None else None
+        if selected_context is not None:
+            print(f"[RLM: {self.name}] Selected context length: {len(selected_context)} characters")
+
+        answer = await self._call_rlm_async(
+            query=query,
+            repl=repl,
+            selected_context=selected_context,
+        )
+        print(f"[RLM: {self.name}] Completed.")
+        return answer
+
+    async def _call_rlm_async(
+        self,
+        query: str,
+        repl: REPL,
+        selected_context: str | None,
+    ) -> str:
+        """Private asynchronous execution loop with concurrent sub-agent dispatch."""
+        prompt = self._build_prompt(
+            query=query,
+            metadata=repl.metadata,
+            selected_context=selected_context,
+            depth=self.recursion_depth,
+        )
+
+        print(f"[RLM: {self.name}] Calling LLM asynchronously...")
+        response = await self.model.call_llm_async(prompt)
+        if not isinstance(response, str):
+            raise RLMError("LLM call must return a string response")
+
+        print(f"[RLM: {self.name}] LLM response:\n{response.strip()}\n")
+
+        code = self._extract_code(response)
+        if code is None:
+            answer = self._final_answer(response)
+            print(f"[RLM: {self.name}] Final answer determined directly.")
+            return answer
+
+        if self.recursion_depth <= 0:
+            print(f"[RLM: {self.name}] Recursion depth limit reached (0 remaining). Cannot spawn sub-agents.")
+            raise RecursionLimitError(
+                f"RLM '{self.name}' reached recursion depth limit before a final answer."
+            )
+
+        print(f"[RLM: {self.name}] Executing generated selection code in REPL:\n{code}")
+        execution = repl.execute_code(code)
+        if not execution.succeeded or not execution.selections:
+            details = execution.error or "Generated code did not produce valid sub-agent selections."
+            print(f"[RLM: {self.name}] Code execution failed: {details}")
+            raise CodeExecutionError(details)
+
+        selections = execution.selections
+        print(f"[RLM: {self.name}] Code execution succeeded. Dispatching {len(selections)} sub-agent(s) concurrently:")
+
+        sub_agents: list[tuple[RLM, str]] = []
+        for i, sel in enumerate(selections, 1):
+            print(
+                f"[RLM: {self.name}] -> Preparing Sub-agent {i}/{len(selections)}: range [{sel.start}:{sel.end}], "
+                f"query: {sel.query!r}"
+            )
+            child_context = repl.context[sel.start : sel.end]
+            sub_agent = RLM(
+                name=f"{self.name}_sub_{i}",
+                model=self.model,
+                context=child_context,
+                recursion_depth=self.recursion_depth - 1,
+            )
+            sub_agents.append((sub_agent, sel.query))
+
+        # Launch all sub-agents concurrently using asyncio.gather
+        tasks = [
+            agent.call_rlm_async(query=sub_q, metadata=repl.metadata)
+            for agent, sub_q in sub_agents
+        ]
+        answers = await asyncio.gather(*tasks)
+
+        sub_results: list[dict[str, str]] = [
+            {"query": sub_q, "answer": ans}
+            for (_, sub_q), ans in zip(sub_agents, answers)
+        ]
+
+        # If single sub-agent was invoked with identical query, return its answer directly
+        if len(sub_results) == 1 and sub_results[0]["query"].strip() == query.strip():
+            print(f"[RLM: {self.name}] Single sub-agent answered original query directly.")
+            return sub_results[0]["answer"]
+
+        # Otherwise synthesize responses from all sub-agents
+        print(f"[RLM: {self.name}] Synthesizing final answer from {len(sub_results)} sub-agent result(s)...")
+        synthesis_prompt = self._build_synthesis_prompt(
+            query=query,
+            metadata=repl.metadata,
+            sub_results=sub_results,
+        )
+        print(f"[RLM: {self.name}] Calling LLM for synthesis (async)...")
+        synthesis_response = await self.model.call_llm_async(synthesis_prompt)
         if not isinstance(synthesis_response, str):
             raise RLMError("LLM synthesis call must return a string response")
 
