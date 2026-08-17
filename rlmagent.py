@@ -66,36 +66,58 @@ class RLM:
         if not isinstance(query, str) or not query.strip():
             raise ValueError("query must be a non-empty string")
 
+        print(f"[RLM: {self.name}] Starting RLM run...")
+        print(f"[RLM: {self.name}] Context length: {len(source_context)} characters")
         repl = REPL(context=source_context, metadata=metadata)
-        return self._call(query=query, repl=repl, selected_context=None, depth=0)
+        answer = self._call(query=query, repl=repl, selected_context=None, depth=0)
+        print(f"[RLM: {self.name}] RLM run completed.")
+        return answer
 
     def _call(self, query: str, repl: REPL, selected_context: str | None, depth: int) -> str:
-        response = self.model.call_llm(
-            self._build_prompt(
-                query=query,
-                metadata=repl.metadata,
-                selected_context=selected_context,
-                depth=depth,
-            )
+        print(f"\n--- [RLM: {self.name} | Depth {depth}] ---")
+        print(f"Query: {query}")
+        if selected_context is not None:
+            print(f"Selected context length: {len(selected_context)} characters")
+
+        prompt = self._build_prompt(
+            query=query,
+            metadata=repl.metadata,
+            selected_context=selected_context,
+            depth=depth,
         )
+        print(f"[RLM: {self.name} | Depth {depth}] Calling LLM...")
+        response = self.model.call_llm(prompt)
         if not isinstance(response, str):
             raise RLMError("LLM call must return a string response")
 
+        print(f"[RLM: {self.name} | Depth {depth}] LLM response:\n{response.strip()}\n")
+
         code = self._extract_code(response)
         if code is None:
-            return self._final_answer(response)
+            answer = self._final_answer(response)
+            print(f"[RLM: {self.name} | Depth {depth}] Final answer determined.")
+            return answer
+
         if depth >= self.recursion_depth:
+            print(f"[RLM: {self.name} | Depth {depth}] Recursion depth limit ({self.recursion_depth}) reached.")
             raise RecursionLimitError(
                 f"RLM '{self.name}' reached recursion depth {self.recursion_depth} before a final answer."
             )
 
+        print(f"[RLM: {self.name} | Depth {depth}] Executing selection code in REPL:\n{code}")
         execution = repl.execute_code(code)
         if not execution.succeeded or execution.selection is None:
             details = execution.error or "Generated code did not produce a context selection."
+            print(f"[RLM: {self.name} | Depth {depth}] Code execution failed: {details}")
             raise CodeExecutionError(details)
 
         selection = execution.selection
+        print(
+            f"[RLM: {self.name} | Depth {depth}] Selected range: [{selection.start}:{selection.end}], "
+            f"Child query: {selection.query!r}"
+        )
         child_context = repl.context[selection.start : selection.end]
+        print(f"[RLM: {self.name} | Depth {depth}] Recursing to depth {depth + 1}...")
         return self._call(
             query=selection.query,
             repl=repl,
