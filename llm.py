@@ -22,11 +22,28 @@ class BaseLLM:
         self.api_key = api_key
 
     def call_llm(self, prompt: str) -> str:
-        """Return a text completion for ``prompt``.
+        """Public entry point: validates inputs, executes provider call, and validates output."""
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise ValueError("prompt must be a non-empty string")
 
-        Provider adapters must override this method.
-        """
-        raise NotImplementedError("BaseLLM does not implement a provider call")
+        try:
+            response = self._call_llm(prompt)
+        except Exception as error:
+            if isinstance(error, LLMCallError):
+                raise
+            raise LLMCallError(
+                f"{self.provider} request failed: {error}"
+            ) from error
+
+        if not isinstance(response, str) or not response.strip():
+            raise LLMCallError(
+                f"{self.provider} returned an empty or invalid response."
+            )
+        return response
+
+    def _call_llm(self, prompt: str) -> str:
+        """Private provider call to be overridden by adapter subclasses."""
+        raise NotImplementedError("Subclasses must implement _call_llm")
 
 
 class GeminiLLM(BaseLLM):
@@ -37,7 +54,7 @@ class GeminiLLM(BaseLLM):
         pip install google-genai
     """
 
-    DEFAULT_MODEL = "gemini-3.7-flash"
+    DEFAULT_MODEL = "gemini-3.6-flash"
 
     def __init__(self, api_key: str, model_name: str = DEFAULT_MODEL) -> None:
         super().__init__(provider="gemini", api_key=api_key)
@@ -54,24 +71,10 @@ class GeminiLLM(BaseLLM):
         self.model_name = model_name
         self._client: Any = genai.Client(api_key=api_key)
 
-    def call_llm(self, prompt: str) -> str:
+    def _call_llm(self, prompt: str) -> str:
         """Send a text prompt to Gemini and return its generated text."""
-        if not isinstance(prompt, str) or not prompt.strip():
-            raise ValueError("prompt must be a non-empty string")
-
-        try:
-            response = self._client.models.generate_content(
-                model=self.model_name,
-                contents=prompt,
-            )
-            text = response.text
-        except Exception as error:
-            raise LLMCallError(
-                f"Gemini request failed for model '{self.model_name}'."
-            ) from error
-
-        if not isinstance(text, str) or not text.strip():
-            raise LLMCallError(
-                f"Gemini returned no text for model '{self.model_name}'."
-            )
-        return text
+        response = self._client.models.generate_content(
+            model=self.model_name,
+            contents=prompt,
+        )
+        return response.text
