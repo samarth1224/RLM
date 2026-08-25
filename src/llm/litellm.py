@@ -6,6 +6,8 @@ from typing import Any
 
 from .base import BaseLLM, LLMConfig
 
+import litellm
+
 
 class LiteLLM(BaseLLM):
     """Universal model completion adapter wrapping the official ``litellm`` SDK.
@@ -18,7 +20,7 @@ class LiteLLM(BaseLLM):
         pip install litellm
     """
 
-    DEFAULT_MODEL = "gpt-4o"
+    DEFAULT_MODEL = "gemini-3.1-flash-lite"
 
     def __init__(
         self,
@@ -39,14 +41,7 @@ class LiteLLM(BaseLLM):
         self.api_version = api_version
         self.organization = organization
 
-        try:
-            import litellm as _litellm_pkg
-        except ImportError as error:
-            raise ImportError(
-                "LiteLLM requires the litellm package. Install it with: pip install litellm"
-            ) from error
-
-        self._litellm = _litellm_pkg
+        self._litellm = litellm
 
     def _prepare_call_kwargs(self, prompt: str) -> dict[str, Any]:
         """Build keyword arguments for litellm.completion / litellm.acompletion."""
